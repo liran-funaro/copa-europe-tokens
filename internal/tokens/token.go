@@ -4,192 +4,155 @@
 package tokens
 
 import (
-	"encoding/base64"
 	"encoding/json"
 
 	"github.com/copa-europe-tokens/internal/common"
 	"github.com/copa-europe-tokens/pkg/types"
-	"github.com/golang/protobuf/proto"
-	"github.com/hyperledger-labs/orion-sdk-go/pkg/bcdb"
-	"github.com/hyperledger-labs/orion-server/pkg/logger"
 	oriontypes "github.com/hyperledger-labs/orion-server/pkg/types"
 	"github.com/pkg/errors"
 )
 
 // TokenTxContext handles a token transaction from start to finish
 type TokenTxContext struct {
-	lg               *logger.SugarLogger
-	typeId           string
-	tokenDBName      string
-	custodianId      string
-	custodianSession bcdb.DBSession
+	txContext
+
+	typeId string
 
 	// Evaluated lazily
-	dataTx        bcdb.DataTxContext
-	description   *types.TokenDescription
-	TxEnvelope    string
-	TxPayloadHash string
+	tokenDBName string
+	description *types.TokenDescription
 }
 
 func getTokenTypeDBName(typeId string) (string, error) {
+	ret := TokenTypeDBNamePrefix + typeId
 	if err := validateMD5Base64ID(typeId, "token type"); err != nil {
-		return "", common.NewErrInvalid("Invalid type ID: %s", err)
+		return ret, common.NewErrInvalid("Invalid type ID: %s", err)
 	}
-	return TokenTypeDBNamePrefix + typeId, nil
+	return ret, nil
 }
 
-// Create a new common token context without initiating a TX.
-func newTokenTxContext(m *Manager, typeId string) (*TokenTxContext, error) {
-	tokenDBName, err := getTokenTypeDBName(typeId)
-	if err != nil {
-		return nil, err
+func (ctx *TokenTxContext) getTokenDBName() string {
+	if ctx.tokenDBName != "" {
+		return ctx.tokenDBName
 	}
-	return &TokenTxContext{
-		lg:               m.lg,
-		custodianSession: m.custodianSession,
-		custodianId:      m.config.Users.Custodian.UserID,
-		tokenDBName:      tokenDBName,
-		typeId:           typeId,
-	}, nil
+
+	tokenDBName, err := getTokenTypeDBName(ctx.typeId)
+	ctx.setError(err)
+	ctx.tokenDBName = tokenDBName
+	return tokenDBName
 }
 
-// ResetTx creates a new transaction. It will abort previous transaction if existed.
-func (ctx *TokenTxContext) ResetTx() error {
-	if ctx.dataTx != nil {
-		if err := ctx.dataTx.Abort(); err != nil {
-			return err
-		}
+func (ctx *TokenTxContext) Get(key string) []byte {
+	tx := ctx.dataTx()
+	if ctx.haveError() || tx == nil {
+		return nil
 	}
-
-	dataTx, err := ctx.custodianSession.DataTx()
-	if err != nil {
-		return errors.Wrap(err, "failed to create DataTx")
-	}
-	ctx.dataTx = dataTx
-
-	return nil
+	val, meta, err := tx.Get(ctx.getTokenDBName(), key)
+	ctx.wrapOrionError(err, "failed to get ket [%v] from db [%s] with metadata [%+v]", key, ctx.getTokenDBName(), meta)
+	return val
 }
 
-// Returns an existing transaction or creates a new one
-func (ctx *TokenTxContext) tx() (bcdb.DataTxContext, error) {
-	if ctx.dataTx == nil {
-		if err := ctx.ResetTx(); err != nil {
-			return nil, err
-		}
+func (ctx *TokenTxContext) Put(key string, val []byte, owner string, mustSign bool) {
+	tx := ctx.dataTx()
+	if ctx.haveError() || tx == nil {
+		return
 	}
-	return ctx.dataTx, nil
-}
-
-func (ctx *TokenTxContext) Get(key string) ([]byte, error) {
-	tx, err := ctx.tx()
-	if err != nil {
-		return nil, err
-	}
-	val, meta, err := tx.Get(ctx.tokenDBName, key)
-	if err != nil {
-		return nil, wrapOrionError(err, "failed to get ket [%v] from db [%s] with metadata [%+v]", key, ctx.tokenDBName, meta)
-	}
-	return val, nil
-}
-
-func (ctx *TokenTxContext) Put(key string, val []byte, owner string, mustSign bool) error {
-	tx, err := ctx.tx()
-	if err != nil {
-		return err
-	}
-	err = tx.Put(ctx.tokenDBName, key, val, &oriontypes.AccessControl{
+	err := tx.Put(ctx.getTokenDBName(), key, val, &oriontypes.AccessControl{
 		ReadWriteUsers: map[string]bool{
-			ctx.custodianId: true,
-			owner:           true,
+			ctx.sessionUserId: true,
+			owner:             true,
 		},
 		SignPolicyForWrite: oriontypes.AccessControl_ALL,
 	})
-	if err != nil {
-		return wrapOrionError(err, "failed to put [%s] in db [%s]", key, ctx.tokenDBName)
-	}
-
+	ctx.wrapOrionError(err, "failed to put [%s] in db [%s]", key, ctx.getTokenDBName())
 	if mustSign {
 		tx.AddMustSignUser(owner)
 	}
-
-	return nil
 }
 
-func (ctx *TokenTxContext) Delete(key string) error {
-	tx, err := ctx.tx()
-	if err != nil {
-		return err
+func (ctx *TokenTxContext) Delete(key string) {
+	tx := ctx.dataTx()
+	if ctx.err != nil || tx == nil {
+		return
 	}
-	if err = tx.Delete(ctx.tokenDBName, key); err != nil {
-		return wrapOrionError(err, "Fail to delete [%s] from db [%s]", key, ctx.tokenDBName)
-	}
-	return nil
+	err := tx.Delete(ctx.getTokenDBName(), key)
+	ctx.wrapOrionError(err, "Fail to delete [%s] from db [%s]", key, ctx.getTokenDBName())
 }
 
-// Abort a TX if it was initiated
-func (ctx *TokenTxContext) Abort() {
-	if ctx != nil && ctx.dataTx != nil {
-		abort(ctx.dataTx)
-		ctx.dataTx = nil
-	}
-}
-
-func (ctx *TokenTxContext) Prepare() error {
-	if ctx.dataTx == nil {
-		return errors.New("Attempt to prepare a transaction, but transaction was not created.")
-	}
-
-	txEnv, err := ctx.dataTx.SignConstructedTxEnvelopeAndCloseTx()
-	if err != nil {
-		return errors.Wrap(err, "failed to construct Tx envelope")
-	}
-
-	txEnvBytes, err := proto.Marshal(txEnv)
-	if err != nil {
-		return errors.Wrap(err, "failed to proto.Marshal Tx envelope")
-	}
-
-	payloadBytes, err := json.Marshal(txEnv.(*oriontypes.DataTxEnvelope).Payload)
-	if err != nil {
-		return errors.Wrap(err, "failed to json.Marshal DataTx")
-	}
-
-	payloadHash, err := ComputeSHA256Hash(payloadBytes)
-	if err != nil {
-		return errors.Wrap(err, "failed to compute hash of DataTx bytes")
-	}
-
-	ctx.TxEnvelope = base64.StdEncoding.EncodeToString(txEnvBytes)
-	ctx.TxPayloadHash = base64.StdEncoding.EncodeToString(payloadHash)
-	return nil
-}
-
-func (ctx *TokenTxContext) getDescription() (*types.TokenDescription, error) {
+func (ctx *TokenTxContext) getDescription() (description *types.TokenDescription) {
 	if ctx.description != nil {
-		return ctx.description, nil
+		return ctx.description
 	}
+
+	description = &types.TokenDescription{}
+	ctx.description = description
 
 	// We create a new session since other users don't have read permissions to the types DB
-	dataTx, err := ctx.custodianSession.DataTx()
+	dataTx, err := ctx.session.DataTx()
 	if err != nil {
-		return nil, errors.Wrap(err, "failed to create DataTx")
+		ctx.wrapError(err, "failed to create DataTx")
+		return
 	}
 	defer abort(dataTx)
 
-	val, meta, err := dataTx.Get(TypesDBName, ctx.tokenDBName)
+	val, meta, err := dataTx.Get(TypesDBName, ctx.getTokenDBName())
+	ctx.wrapOrionError(err, "failed to Get description of type [%s]", ctx.typeId)
 	if err != nil {
-		return nil, wrapOrionError(err, "failed to Get description of type [%s]", ctx.typeId)
+		return
 	}
 	if val == nil {
-		return nil, common.NewErrNotFound("token type not found")
+		ctx.setError(common.NewErrNotFound("token type not found"))
+		return
 	}
 
-	desc := types.TokenDescription{}
-	if err = json.Unmarshal(val, &desc); err != nil {
-		return nil, errors.Wrapf(err, "failed to json.Unmarshal %s for type %s", val, ctx.typeId)
-	}
-	ctx.lg.Debugf("Token type description: %+v; metadata: %v", &desc, meta)
+	err = json.Unmarshal(val, description)
+	ctx.wrapError(err, "failed to json.Unmarshal %s for type %s", val, ctx.typeId)
+	ctx.lg.Debugf("Token type description: %+v; metadata: %v", description, meta)
+	return
+}
 
-	ctx.description = &desc
-	return ctx.description, nil
+func (ctx *TokenTxContext) createTokenDBTable(indices ...string) {
+	dBsTx := ctx.dbsTx()
+	if ctx.haveError() || dBsTx == nil {
+		return
+	}
+
+	exists, err := dBsTx.Exists(ctx.getTokenDBName())
+	ctx.wrapError(err, "failed to query DB existence")
+	if exists {
+		ctx.setError(common.NewErrExist("failed to deploy token: token type [%s] exists", ctx.typeId))
+	}
+
+	index := make(map[string]oriontypes.IndexAttributeType)
+	for _, ind := range indices {
+		index[ind] = oriontypes.IndexAttributeType_STRING
+	}
+	err = dBsTx.CreateDB(ctx.getTokenDBName(), index)
+	ctx.wrapError(err, "failed to create DB")
+	ctx.Commit()
+}
+
+func (ctx *TokenTxContext) publishTokenDescription() {
+	if ctx.description == nil {
+		ctx.setError(errors.New("No description was set in this transaction context"))
+		return
+	}
+
+	// Save token description to Types-DB
+	dataTx := ctx.dataTx()
+	if ctx.haveError() || dataTx == nil {
+		return
+	}
+
+	existingTokenDesc, _, err := dataTx.Get(TypesDBName, ctx.tokenDBName)
+	ctx.wrapOrionError(err, "failed to get key [%s] from [%s]", ctx.tokenDBName, TypesDBName)
+	if existingTokenDesc != nil {
+		ctx.setError(errors.Errorf("failed to deploy token: custodian does not have privilege, but token type description exists: %s", string(existingTokenDesc)))
+	}
+
+	serializedDescription, err := json.Marshal(ctx.description)
+	ctx.setError(err)
+	err = dataTx.Put(TypesDBName, ctx.getTokenDBName(), serializedDescription, nil)
+	ctx.wrapOrionError(err, "failed to put key [%s] to [%s]", ctx.getTokenDBName(), TypesDBName)
+	ctx.Commit()
 }

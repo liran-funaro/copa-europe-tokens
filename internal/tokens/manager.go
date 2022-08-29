@@ -180,87 +180,69 @@ func (m *Manager) GetStatus() (string, error) {
 // Generic token helpers
 // ====================================================
 
-func (m *Manager) deployNewTokenType(desc *types.TokenDescription, indices ...string) error {
-	if desc.Name == "" {
-		return common.NewErrInvalid("token type name is empty")
+// Create a new common token context without initiating a TX.
+func (m *Manager) newTokenTxContext(typeId string) *TokenTxContext {
+	return &TokenTxContext{
+		txContext: txContext{
+			lg:            m.lg,
+			session:       m.custodianSession,
+			sessionUserId: m.config.Users.Custodian.UserID,
+		},
+		typeId: typeId,
 	}
+}
 
+func (m *Manager) newFungibleTxContext(typeId string) *FungibleTxContext {
+	return &FungibleTxContext{*m.newTokenTxContext(typeId)}
+}
+
+func (m *Manager) newUserTxContext(userId string) *UserTxContext {
+	return &UserTxContext{
+		txContext: txContext{
+			lg:            m.lg,
+			session:       m.adminSession,
+			sessionUserId: m.config.Users.Admin.UserID,
+		},
+		userId: userId,
+	}
+}
+
+func (m *Manager) deployNewTokenType(desc *types.TokenDescription, indices ...string) error {
 	// Compute TypeId
 	tokenTypeIDBase64, err := NameToID(desc.Name)
-	if err != nil {
-		return errors.Wrap(err, "failed to compute hash of token type name")
-	}
-	tokenDBName := TokenTypeDBNamePrefix + tokenTypeIDBase64
 	desc.TypeId = tokenTypeIDBase64
-
-	// Check existence by looking into the custodian privileges
-	userTx, err := m.adminSession.UsersTx()
-	if err != nil {
-		return errors.Wrap(err, "failed to create UsersTx")
+	ctx := &TokenTxContext{
+		txContext: txContext{
+			lg:            m.lg,
+			session:       m.adminSession,
+			sessionUserId: m.config.Users.Admin.UserID,
+			err:           err,
+		},
+		typeId:      desc.TypeId,
+		description: desc,
 	}
-	defer abort(userTx)
+	defer ctx.Abort()
 
-	custodian, err := userTx.GetUser(m.config.Users.Custodian.UserID)
-	if err != nil {
-		return wrapOrionError(err, "failed to get user [%s]", m.config.Users.Custodian.UserID)
+	// Create the token DB table
+	if ctx.createTokenDBTable(indices...); ctx.haveError() {
+		return ctx.Error()
 	}
-	if _, exists := custodian.GetPrivilege().GetDbPermission()[tokenDBName]; exists {
-		return common.NewErrExist("token type already exists")
+
+	// Add custodian privileges
+	userTx := m.newUserTxContext(m.config.Users.Custodian.UserID)
+	defer userTx.Abort()
+	userTx.AddPrivilege(ctx.typeId)
+	if userTx.Commit(); userTx.haveError() {
+		return userTx.Error()
 	}
 
 	// Save token description to Types-DB
-	dataTx, err := m.adminSession.DataTx()
-	if err != nil {
-		return errors.Wrap(err, "failed to create DataTx")
-	}
-	defer abort(dataTx)
-
-	existingTokenDesc, _, err := dataTx.Get(TypesDBName, tokenDBName)
-	if err != nil {
-		return wrapOrionError(err, "failed to get key [%s] from [%s]", tokenDBName, TypesDBName)
-	}
-	if existingTokenDesc != nil {
-		return errors.Errorf("failed to deploy token: custodian does not have privilege, but token type description exists: %s", string(existingTokenDesc))
+	ctx.publishTokenDescription()
+	if !ctx.haveError() {
+		m.tokenTypesDBs[ctx.getTokenDBName()] = true
 	}
 
-	serializedDescription, err := json.Marshal(desc)
-	if err != nil {
-		m.lg.Panicf("failed to json.Marshal description: %s", err)
-		return err
-	}
-	err = dataTx.Put(TypesDBName, tokenDBName, serializedDescription, nil)
-	if err != nil {
-		return wrapOrionError(err, "failed to put key [%s] to [%s]", tokenDBName, TypesDBName)
-	}
-
-	txID, receiptEnv, err := dataTx.Commit(true)
-	if err != nil {
-		return wrapOrionError(err, "failed to commit [%s] to [%s]", tokenDBName, TypesDBName)
-	}
-
-	m.lg.Infof("Saved token description: %+v; txID: %s, receipt: %+v", desc, txID, receiptEnv.GetResponse().GetReceipt())
-
-	if err = m.createTokenDBTable(tokenDBName, indices...); err != nil {
-		return err
-	}
-
-	// Add privilege to custodian
-	custodian.Privilege.DbPermission[tokenDBName] = oriontypes.Privilege_ReadWrite
-
-	err = userTx.PutUser(custodian, nil)
-	if err != nil {
-		return wrapOrionError(err, "failed to put user [%s]", m.config.Users.Custodian.UserID)
-	}
-
-	txID, receiptEnv, err = userTx.Commit(true)
-	if err != nil {
-		return wrapOrionError(err, "failed to commit user [%s]", m.config.Users.Custodian.UserID)
-	}
-
-	m.tokenTypesDBs[tokenDBName] = true
-	m.lg.Infof("Custodian [%s] granted RW privilege to database: %s; description: %s, txID: %s, receipt: %+v", m.config.Users.Custodian.UserID, desc, tokenDBName, txID, receiptEnv.GetResponse().GetReceipt())
-
-	return nil
+	return ctx.Error()
 }
 
 func (m *Manager) createTokenDBTable(tokenDBName string, indices ...string) error {
@@ -302,24 +284,17 @@ func (m *Manager) createTokenDBTable(tokenDBName string, indices ...string) erro
 // ====================================================
 
 func (m *Manager) DeployTokenType(deployRequest *types.DeployRequest) (*types.DeployResponse, error) {
+	var indices []string
 	switch deployRequest.Class {
 	case "": //backward compatibility
 		deployRequest.Class = constants.TokenClass_NFT
-	case constants.TokenClass_NFT:
-	case constants.TokenClass_FUNGIBLE:
-	case constants.TokenClass_ANNOTATIONS:
-	default:
-		return nil, &ErrInvalid{ErrMsg: fmt.Sprintf("unsupported token class: %s", deployRequest.Class)}
-	}
-
-	var indices []string
-	switch deployRequest.Class {
+		fallthrough
 	case constants.TokenClass_NFT:
 		indices = []string{"owner"}
-	case constants.TokenClass_FUNGIBLE:
-		return nil, &ErrInvalid{ErrMsg: fmt.Sprintf("Class is not supported via this API call: %s", deployRequest.Class)}
 	case constants.TokenClass_ANNOTATIONS:
 		indices = []string{"owner", "link"}
+	case constants.TokenClass_FUNGIBLE:
+		return nil, &ErrInvalid{ErrMsg: fmt.Sprintf("Class is not supported via this API call: %s", deployRequest.Class)}
 	default:
 		return nil, &ErrInvalid{ErrMsg: fmt.Sprintf("unsupported token class: %s", deployRequest.Class)}
 	}
@@ -329,7 +304,6 @@ func (m *Manager) DeployTokenType(deployRequest *types.DeployRequest) (*types.De
 		Description: deployRequest.Description,
 		Class:       deployRequest.Class,
 	}
-
 	if err := m.deployNewTokenType(&tokenDesc, indices...); err != nil {
 		return nil, convertErrorType(err)
 	}
@@ -1217,13 +1191,12 @@ func (m *Manager) validateUserId(userId string) error {
 
 func (m *Manager) FungibleDeploy(request *types.FungibleDeployRequest) (*types.FungibleDeployResponse, error) {
 	// Validates user to avoid creating a token with an invalid owner
-	userCtx, err := newUserTxContext(m, request.ReserveOwner)
-	if err != nil {
-		return nil, err
-	}
+	userCtx := m.newUserTxContext(request.ReserveOwner)
 	defer userCtx.Abort()
-	if err = userCtx.ValidateUserExists(); err != nil {
-		return nil, err
+	userCtx.setError(m.validateUserId(userCtx.userId))
+	userCtx.ValidateUserExists()
+	if userCtx.haveError() {
+		return nil, userCtx.Error()
 	}
 
 	desc := types.TokenDescription{
@@ -1234,16 +1207,12 @@ func (m *Manager) FungibleDeploy(request *types.FungibleDeployRequest) (*types.F
 			"reserveOwner": request.ReserveOwner,
 		},
 	}
-	if err = m.deployNewTokenType(&desc, "owner", "account"); err != nil {
+	if err := m.deployNewTokenType(&desc, "owner", "account"); err != nil {
 		return nil, err
 	}
 
-	if err = userCtx.AddPrivilege(desc.TypeId); err != nil {
-		return nil, err
-	}
-	if err = userCtx.Commit(); err != nil {
-		return nil, err
-	}
+	userCtx.AddPrivilege(desc.TypeId)
+	userCtx.Commit()
 
 	return &types.FungibleDeployResponse{
 		TypeId:       desc.TypeId,
@@ -1252,88 +1221,49 @@ func (m *Manager) FungibleDeploy(request *types.FungibleDeployRequest) (*types.F
 		ReserveOwner: request.ReserveOwner,
 		Supply:       0,
 		Url:          FungibleTypeURL(desc.TypeId),
-	}, nil
+	}, userCtx.Error()
 }
 
 func (m *Manager) FungibleDescribe(typeId string) (*types.FungibleDescribeResponse, error) {
-	ctx, err := newFungibleTxContext(m, typeId)
-	if err != nil {
-		return nil, err
-	}
+	ctx := m.newFungibleTxContext(typeId)
 	defer ctx.Abort()
 
-	desc, err := ctx.getDescription()
-	if err != nil {
-		return nil, err
+	ret := &types.FungibleDescribeResponse{
+		TypeId:       ctx.getDescription().TypeId,
+		Name:         ctx.getDescription().Name,
+		Description:  ctx.getDescription().Description,
+		ReserveOwner: ctx.getReserveOwner(),
+		Supply:       ctx.getReserveAccount().Supply,
+		Url:          FungibleTypeURL(ctx.getDescription().TypeId),
 	}
-
-	reserve, err := ctx.getReserveAccount()
-	if err != nil {
-		return nil, err
-	}
-
-	reserveOwner, err := ctx.getReserveOwner()
-	if err != nil {
-		return nil, err
-	}
-
-	return &types.FungibleDescribeResponse{
-		TypeId:       desc.TypeId,
-		Name:         desc.Name,
-		Description:  desc.Description,
-		ReserveOwner: reserveOwner,
-		Supply:       reserve.Supply,
-		Url:          FungibleTypeURL(desc.TypeId),
-	}, nil
+	return ret, ctx.Error()
 }
 
 func (m *Manager) FungiblePrepareMint(typeId string, request *types.FungibleMintRequest) (*types.FungibleMintResponse, error) {
+	ctx := m.newFungibleTxContext(typeId)
+	defer ctx.Abort()
+
 	if request.Supply == 0 {
 		return nil, common.NewErrInvalid("Supply must be a positive integer (supply > 0).")
 	}
 
-	ctx, err := newFungibleTxContext(m, typeId)
-	if err != nil {
-		return nil, err
-	}
-	defer ctx.Abort()
-
-	reserve, err := ctx.getReserveAccount()
-	if err != nil {
-		return nil, err
-	}
-
+	reserve := ctx.getReserveAccount()
 	reserve.Balance += request.Supply
 	reserve.Supply += request.Supply
 
-	if err = ctx.putReserveAccount(reserve); err != nil {
-		return nil, err
-	}
-
-	if err = ctx.Prepare(); err != nil {
-		return nil, err
-	}
+	ctx.putReserveAccount(reserve)
+	ctx.Prepare()
 	m.lg.Debugf("Processed mint request for token: %s", ctx.typeId)
 
 	return &types.FungibleMintResponse{
 		TypeId:        typeId,
-		TxEnvelope:    ctx.TxEnvelope,
-		TxPayloadHash: ctx.TxPayloadHash,
-	}, nil
+		TxEnvelope:    ctx.txEnvelope,
+		TxPayloadHash: ctx.txPayloadHash,
+	}, ctx.Error()
 }
 
 func (m *Manager) FungiblePrepareTransfer(typeId string, request *types.FungibleTransferRequest) (*types.FungibleTransferResponse, error) {
-	// No need to validate the existing owner. We will fail later if the owner's account does not exist.
-	// If the new owner doesn't exist, then we will fail during the submit phase.
-	err := m.validateUserId(request.NewOwner)
-	if err != nil {
-		return nil, err
-	}
-
-	ctx, err := newFungibleTxContext(m, typeId)
-	if err != nil {
-		return nil, err
-	}
+	ctx := m.newFungibleTxContext(typeId)
 	defer ctx.Abort()
 
 	// If account isn't specified, the main account is used
@@ -1341,122 +1271,83 @@ func (m *Manager) FungiblePrepareTransfer(typeId string, request *types.Fungible
 		request.Account = mainAccount
 	}
 
+	// No need to validate the existing owner. We will fail later if the owner's account does not exist.
+	// If the new owner doesn't exist, then we will fail during the submit phase.
+	ctx.setError(m.validateUserId(request.NewOwner))
+
 	// Retry until we got a response.
 	var response *types.FungibleTransferResponse = nil
-	for response == nil {
-		response, err = ctx.internalFungiblePrepareTransfer(request)
-		if err != nil {
-			return nil, err
-		}
+	for response == nil && !ctx.haveError() {
+		response = ctx.internalFungiblePrepareTransfer(request)
 	}
-
-	return response, nil
+	return response, ctx.Error()
 }
 
 func (m *Manager) FungiblePrepareConsolidate(typeId string, request *types.FungibleConsolidateRequest) (*types.FungibleConsolidateResponse, error) {
-	ctx, err := newFungibleTxContext(m, typeId)
-	if err != nil {
-		return nil, err
-	}
+	ctx := m.newFungibleTxContext(typeId)
 	defer ctx.Abort()
 
 	// We don't need to validate the user since an invalid user will not have any accounts anyway.
 
-	if request.Accounts != nil {
-		// Validate the list before the TX starts.
-		if len(request.Accounts) == 0 {
-			return nil, common.NewErrInvalid("If an account list is specified, it must have at least one account.")
-		}
+	if request.Accounts != nil && len(request.Accounts) == 0 {
+		ctx.setError(common.NewErrInvalid("If an account list is specified, it must have at least one account."))
+	}
 
-		for _, accName := range request.Accounts {
-			if accName == "" {
-				return nil, common.NewErrInvalid("Account name cannot be empty")
-			} else if accName == mainAccount {
-				return nil, common.NewErrInvalid("'%v' account cannot be consolidated", accName)
+	if request.Accounts == nil {
+		// We query all user's accounts outside the data TX scope.
+		// Yet, we need to read all records again inside the data TX scope, so it will be included in the read-set.
+		for _, record := range ctx.queryAccounts(request.Owner, "") {
+			if record.Account != mainAccount {
+				request.Accounts = append(request.Accounts, record.Account)
 			}
-		}
-	} else {
-		// We query all user's accounts before the TX starts.
-		// Yet, we need to read all records again inside the TX context, so it will be included in the read-set.
-		records, err := ctx.queryAccounts(request.Owner, "")
-		if err != nil {
-			return nil, err
-		}
-
-		for _, record := range records {
-			if record.Account == mainAccount {
-				continue
-			}
-			request.Accounts = append(request.Accounts, record.Account)
 		}
 
 		if len(request.Accounts) == 0 {
-			return nil, common.NewErrNotFound("Did not found accounts to consolidate for user [%s]", request.Owner)
-		}
-	}
-
-	rawMainRecord, err := ctx.getAccountRecordRaw(request.Owner, mainAccount)
-	if err != nil {
-		return nil, err
-	}
-
-	var mainRecord *types.FungibleAccountRecord
-	if rawMainRecord == nil {
-		mainRecord = &types.FungibleAccountRecord{
-			Account: mainAccount,
-			Owner:   request.Owner,
-			Balance: 0,
-			Comment: mainAccount,
-		}
-	} else {
-		mainRecord, err = unmarshalAccountRecord(rawMainRecord)
-		if err != nil {
-			return nil, err
+			ctx.setError(common.NewErrNotFound("Did not found accounts to consolidate for user [%s]", request.Owner))
 		}
 	}
 
 	for _, accName := range request.Accounts {
-		accRecord, err := ctx.getAccountRecord(request.Owner, accName)
-		if err != nil {
-			return nil, err
+		if accName == "" {
+			ctx.setError(common.NewErrInvalid("Account name cannot be empty"))
+		} else if accName == mainAccount {
+			ctx.setError(common.NewErrInvalid("'%v' account cannot be consolidated", accName))
 		}
+	}
 
+	mainRecord := ctx.getAccountRecordOrDefault(request.Owner, mainAccount, &types.FungibleAccountRecord{
+		Account: mainAccount,
+		Owner:   request.Owner,
+		Balance: 0,
+		Comment: mainAccount,
+	})
+
+	for _, accName := range request.Accounts {
+		accRecord := ctx.getAccountRecord(request.Owner, accName)
 		mainRecord.Balance += accRecord.Balance
-
-		if err = ctx.deleteAccountRecord(accRecord); err != nil {
-			return nil, err
-		}
+		ctx.deleteAccountRecord(accRecord)
 	}
 
-	if err = ctx.putAccountRecord(mainRecord); err != nil {
-		return nil, err
-	}
-
-	if err = ctx.Prepare(); err != nil {
-		return nil, err
-	}
+	ctx.putAccountRecord(mainRecord)
+	ctx.Prepare()
 
 	return &types.FungibleConsolidateResponse{
 		TypeId:        typeId,
 		Owner:         request.Owner,
-		TxEnvelope:    ctx.TxEnvelope,
-		TxPayloadHash: ctx.TxPayloadHash,
-	}, nil
+		TxEnvelope:    ctx.txEnvelope,
+		TxPayloadHash: ctx.txPayloadHash,
+	}, ctx.Error()
 }
 
 func (m *Manager) FungibleSubmitTx(submitRequest *types.FungibleSubmitRequest) (*types.FungibleSubmitResponse, error) {
 	ctx := submitContextFromFungible(submitRequest)
-	if err := m.submitTx(ctx); err != nil {
-		return nil, err
-	}
-	return ctx.ToFungibleResponse(), nil
+	err := m.submitTx(ctx)
+	return ctx.ToFungibleResponse(), err
 }
 
 func (m *Manager) FungibleAccounts(typeId string, owner string, account string) ([]types.FungibleAccountRecord, error) {
-	ctx, err := newFungibleTxContext(m, typeId)
-	if err != nil {
-		return nil, err
-	}
+	ctx := m.newFungibleTxContext(typeId)
 	defer ctx.Abort()
-	return ctx.queryAccounts(owner, account)
+	records := ctx.queryAccounts(owner, account)
+	return records, ctx.Error()
 }

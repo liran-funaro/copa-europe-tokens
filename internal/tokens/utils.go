@@ -49,6 +49,10 @@ func ComputeMD5Hash(msgBytes []byte) ([]byte, error) {
 }
 
 func NameToID(name string) (string, error) {
+	if name == "" {
+		return "", common.NewErrInvalid("token type name is empty")
+	}
+
 	tokenIDBytes, err := ComputeMD5Hash([]byte(name))
 	if err != nil {
 		return "", errors.Wrap(err, "failed to compute hash of name")
@@ -118,23 +122,28 @@ func convertErrorType(err error) error {
 var orionErrorDetectors = map[int][]*regexp.Regexp{
 	http.StatusForbidden: {
 		// Detects unauthorized (401) error message
-		regexp.MustCompile(`(?i)status\s*:\s*401\s*unauthorized.*message:\s*(.*)`),
+		regexp.MustCompile(`(?i)status\s*:\s*401\s*unauthorized.*message\s*:\s*(.*)`),
 		// Workaround for issue: missing signature return bad-request (400) instead of unauthorized (401)
-		regexp.MustCompile(`(?i)message:\s*(users\s*\[.*]\s*in\s*the\s*must\s*sign\s*list\s*have\s*not\s*signed\s*the\s*transaction.*)`),
+		regexp.MustCompile(`(?i)message\s*:\s*(users\s*\[.*]\s*in\s*the\s*must\s*sign\s*list\s*have\s*not\s*signed\s*the\s*transaction.*)`),
 	},
 	http.StatusNotFound: {
+		// Detects not found (404) error message
+		regexp.MustCompile(`(?i)status\s*:\s*404\s*Not\s*Found.*message\s*:\s*(.*)`),
 		// Detects that a user was not found
-		regexp.MustCompile(`(?i)reason:\s*(the\s*user\s*\[.*]\s*defined\s*in\s*the\s*access\s*control\s*for\s*the\s*key\s*\[.*]\s*does\s*not\s*exist.*)`),
+		regexp.MustCompile(`(?i)reason\s*:\s*(the\s*user\s*\[.*]\s*defined\s*in\s*the\s*access\s*control\s*for\s*the\s*key\s*\[.*]\s*does\s*not\s*exist.*)`),
 		// Detects that a DB does not exist
-		regexp.MustCompile(`(?i)message:\s*((?:error\s*db)?\s*'.*'\s*(?:doesn't|does\s*not)\s*exist.*)`),
+		regexp.MustCompile(`(?i)message\s*:\s*((?:error\s*db)?\s*'.*'\s*(?:doesn't|does\s*not)\s*exist.*)`),
 	},
 	http.StatusConflict: {
 		// Detects attempt to create a DB with an existing name
-		regexp.MustCompile(`(?i)reason:\s*(.*\[.*]\s*already\s*exists.*)`),
+		regexp.MustCompile(`(?i)reason\s*:\s*(.*\[.*]\s*already\s*exists.*)`),
 	},
 }
 
 func wrapOrionError(err error, format string, a ...interface{}) error {
+	if err == nil {
+		return nil
+	}
 	format += ": %s"
 	errStr := err.Error()
 	for status, expressions := range orionErrorDetectors {

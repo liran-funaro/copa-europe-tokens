@@ -36,14 +36,6 @@ type FungibleTxContext struct {
 	TokenTxContext
 }
 
-func newFungibleTxContext(m *Manager, typeId string) (*FungibleTxContext, error) {
-	genericCtx, err := newTokenTxContext(m, typeId)
-	if err != nil {
-		return nil, err
-	}
-	return &FungibleTxContext{*genericCtx}, nil
-}
-
 func getAccountKey(owner string, account string) string {
 	return fmt.Sprintf("%s:%s", owner, account)
 }
@@ -52,121 +44,96 @@ func getAccountKeyFromRecord(record *types.FungibleAccountRecord) string {
 	return getAccountKey(record.Owner, record.Account)
 }
 
-func (ctx *FungibleTxContext) getReserveOwner() (string, error) {
-	desc, err := ctx.getDescription()
-	if err != nil {
-		return "", err
-	}
+func (ctx *FungibleTxContext) getReserveOwner() string {
+	desc := ctx.getDescription()
 	owner, ok := desc.Extension["reserveOwner"]
 	if !ok {
-		return "", common.NewErrInternal("reserve owner is not specified for token type [%s]", ctx.typeId)
+		ctx.setError(common.NewErrInternal("reserve owner is not specified for token type [%s]", ctx.typeId))
 	}
-	return owner, nil
+	return owner
 }
 
-func (ctx *FungibleTxContext) getAccountRecordRaw(owner string, account string) ([]byte, error) {
+func (ctx *FungibleTxContext) getAccountRecordRaw(owner string, account string) []byte {
 	return ctx.Get(getAccountKey(owner, account))
 }
 
-func unmarshalAccountRecord(rawRecord []byte) (*types.FungibleAccountRecord, error) {
-	record := types.FungibleAccountRecord{}
-	if err := json.Unmarshal(rawRecord, &record); err != nil {
-		return nil, errors.Wrapf(err, "failed to json.Unmarshal %s", rawRecord)
+func (ctx *FungibleTxContext) getAccountRecordOrDefault(
+	owner string, account string, defaultAccount *types.FungibleAccountRecord,
+) *types.FungibleAccountRecord {
+	rawRecord := ctx.getAccountRecordRaw(owner, account)
+	if rawRecord == nil {
+		return defaultAccount
 	}
-	return &record, nil
+
+	record := &types.FungibleAccountRecord{}
+	err := json.Unmarshal(rawRecord, record)
+	ctx.wrapError(err, "failed to json.Unmarshal %s", rawRecord)
+	return record
 }
 
-func (ctx *FungibleTxContext) getAccountRecord(owner string, account string) (*types.FungibleAccountRecord, error) {
-	val, err := ctx.getAccountRecordRaw(owner, account)
-	if err != nil {
-		return nil, err
+func (ctx *FungibleTxContext) getAccountRecord(owner string, account string) *types.FungibleAccountRecord {
+	defaultRecord := &types.FungibleAccountRecord{}
+	record := ctx.getAccountRecordOrDefault(owner, account, defaultRecord)
+	if record == defaultRecord {
+		ctx.setError(common.NewErrNotFound("account [%v] of user [%s] does not exists", account, owner))
 	}
-	if val == nil {
-		ctx.lg.Debugf("Account does not exists: DB: %s, user %s, account: %s", ctx.tokenDBName, owner, account)
-		return nil, common.NewErrNotFound("account [%v] of user [%s] does not exists", account, owner)
-	}
-
-	return unmarshalAccountRecord(val)
+	return record
 }
 
-func (ctx *FungibleTxContext) putAccountRecord(record *types.FungibleAccountRecord) error {
+func (ctx *FungibleTxContext) putAccountRecord(record *types.FungibleAccountRecord) {
 	val, err := json.Marshal(record)
-	if err != nil {
-		return errors.Wrap(err, "failed to json.Marshal record")
-	}
+	ctx.wrapError(err, "failed to json.Marshal record")
 
 	recordOwner := record.Owner
 	if record.Owner == reserveAccountUser {
-		recordOwner, err = ctx.getReserveOwner()
-		if err != nil {
-			return err
-		}
+		recordOwner = ctx.getReserveOwner()
 	}
 
-	return ctx.Put(getAccountKeyFromRecord(record), val, recordOwner, record.Account == mainAccount)
+	ctx.Put(getAccountKeyFromRecord(record), val, recordOwner, record.Account == mainAccount)
 }
 
-func (ctx *FungibleTxContext) deleteAccountRecord(record *types.FungibleAccountRecord) error {
-	return ctx.Delete(getAccountKeyFromRecord(record))
+func (ctx *FungibleTxContext) deleteAccountRecord(record *types.FungibleAccountRecord) {
+	ctx.Delete(getAccountKeyFromRecord(record))
 }
 
-func decodeReserveAccountComment(serializedComment string) (*ReserveAccountComment, error) {
-	comment := ReserveAccountComment{Supply: 0}
+func (ctx *FungibleTxContext) decodeReserveAccountComment(serializedComment string) *ReserveAccountComment {
+	comment := &ReserveAccountComment{Supply: 0}
 	if serializedComment == "" {
-		return &comment, nil
+		return comment
 	}
-	if err := json.Unmarshal([]byte(serializedComment), &comment); err != nil {
-		return nil, errors.Wrapf(err, "failed to json.Unmarshal comment %s", serializedComment)
-	}
-	return &comment, nil
+	err := json.Unmarshal([]byte(serializedComment), comment)
+	ctx.wrapError(err, "failed to json.Unmarshal comment %s", serializedComment)
+	return comment
 }
 
-func encodeReserveAccountComment(comment *ReserveAccountComment) (string, error) {
+func (ctx *FungibleTxContext) encodeReserveAccountComment(comment *ReserveAccountComment) string {
 	byteComment, err := json.Marshal(comment)
-	if err != nil {
-		return "", errors.Wrap(err, "failed to json.Marshal comment")
-	}
-	return string(byteComment), nil
+	ctx.wrapError(err, "failed to json.Marshal comment")
+	return string(byteComment)
 }
 
-func (ctx *FungibleTxContext) getReserveAccount() (*ReserveAccountRecord, error) {
-	rawRecord, err := ctx.getAccountRecordRaw(reserveAccountUser, mainAccount)
-	if err != nil {
-		return nil, err
+func (ctx *FungibleTxContext) getReserveAccount() *ReserveAccountRecord {
+	record := ctx.getAccountRecordOrDefault(reserveAccountUser, mainAccount, nil)
+	if record == nil {
+		return &ReserveAccountRecord{Balance: 0, Supply: 0}
 	}
-	if rawRecord == nil {
-		return &ReserveAccountRecord{Balance: 0, Supply: 0}, nil
-	}
-
-	record, err := unmarshalAccountRecord(rawRecord)
-	if err != nil {
-		return nil, err
-	}
-	comment, err := decodeReserveAccountComment(record.Comment)
-	if err != nil {
-		return nil, err
-	}
-
+	comment := ctx.decodeReserveAccountComment(record.Comment)
 	return &ReserveAccountRecord{
 		Balance: record.Balance,
 		Supply:  comment.Supply,
-	}, nil
+	}
 }
 
-func (ctx *FungibleTxContext) putReserveAccount(reserve *ReserveAccountRecord) error {
-	serializedComment, err := encodeReserveAccountComment(&ReserveAccountComment{Supply: reserve.Supply})
-	if err != nil {
-		return err
-	}
-	return ctx.putAccountRecord(&types.FungibleAccountRecord{
+func (ctx *FungibleTxContext) putReserveAccount(reserve *ReserveAccountRecord) {
+	ctx.putAccountRecord(&types.FungibleAccountRecord{
 		Account: mainAccount,
 		Owner:   reserveAccountUser,
 		Balance: reserve.Balance,
-		Comment: serializedComment,
+		Comment: ctx.encodeReserveAccountComment(&ReserveAccountComment{Supply: reserve.Supply}),
 	})
 }
 
-func (ctx *FungibleTxContext) queryAccounts(owner string, account string) ([]types.FungibleAccountRecord, error) {
+func (ctx *FungibleTxContext) queryAccounts(owner string, account string) []types.FungibleAccountRecord {
 	var query string
 	if owner != "" && account != "" {
 		query = fmt.Sprintf(`
@@ -202,29 +169,28 @@ func (ctx *FungibleTxContext) queryAccounts(owner string, account string) ([]typ
 		}`
 	}
 
-	jq, err := ctx.custodianSession.Query()
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to create JSONQuery")
+	jq, err := ctx.session.Query()
+	ctx.wrapError(err, "failed to create JSONQuery")
+	if jq == nil {
+		return nil
 	}
-	queryResults, err := jq.ExecuteJSONQuery(ctx.tokenDBName, query)
-	if err != nil {
-		return nil, wrapOrionError(err, "failed to execute JSONQuery for token type [%s]", ctx.typeId)
-	}
+
+	queryResults, err := jq.ExecuteJSONQuery(ctx.getTokenDBName(), query)
+	ctx.wrapOrionError(err, "failed to execute JSONQuery for token type [%s]", ctx.typeId)
 
 	records := make([]types.FungibleAccountRecord, len(queryResults))
 	for i, res := range queryResults {
 		if err = json.Unmarshal(res.GetValue(), &records[i]); err != nil {
-			return nil, errors.Wrap(err, "failed to json.Unmarshal JSONQuery result")
+			ctx.setError(errors.Wrap(err, "failed to json.Unmarshal JSONQuery result"))
+			break
 		}
 	}
-	return records, nil
+	return records
 }
 
-func (ctx *FungibleTxContext) internalFungiblePrepareTransfer(request *types.FungibleTransferRequest) (*types.FungibleTransferResponse, error) {
+func (ctx *FungibleTxContext) internalFungiblePrepareTransfer(request *types.FungibleTransferRequest) *types.FungibleTransferResponse {
 	txUUID, err := uuid.NewRandom()
-	if err != nil {
-		return nil, errors.Wrapf(err, "Failed to generate tx ID")
-	}
+	ctx.wrapError(err, "Failed to generate tx ID")
 	newRecord := types.FungibleAccountRecord{
 		Account: txUUID.String(),
 		Owner:   request.NewOwner,
@@ -233,52 +199,35 @@ func (ctx *FungibleTxContext) internalFungiblePrepareTransfer(request *types.Fun
 	}
 
 	// Make sure we start a new TX to avoid false sharing with previous attempts
-	if err = ctx.ResetTx(); err != nil {
-		return nil, err
+	if ctx.ResetDataTx(); ctx.haveError() {
+		return nil
 	}
 
 	// Verify that the new generated account does not exist
-	val, err := ctx.getAccountRecordRaw(newRecord.Owner, newRecord.Account)
-	if err != nil {
-		return nil, err
-	}
+	val := ctx.getAccountRecordRaw(newRecord.Owner, newRecord.Account)
 	if val != nil {
 		// Account already exist. We need to retry with a new TX
 		// to avoid false sharing between the existing account.
-		return nil, nil // Signify the calling method to retry.
+		return nil // Signify the calling method to retry.
 	}
 
-	fromRecord, err := ctx.getAccountRecord(request.Owner, request.Account)
-	if err != nil {
-		return nil, err
-	}
-
+	fromRecord := ctx.getAccountRecord(request.Owner, request.Account)
 	if request.Quantity > fromRecord.Balance {
-		return nil, common.NewErrInvalid("Insufficient funds in account %v of %v. Requested %v, Balance: %v", fromRecord.Account, fromRecord.Owner, request.Quantity, fromRecord.Balance)
+		ctx.setError(common.NewErrInvalid("Insufficient funds in account %v of %v. Requested %v, Balance: %v", fromRecord.Account, fromRecord.Owner, request.Quantity, fromRecord.Balance))
+		return nil
 	}
 
 	fromRecord.Balance -= request.Quantity
-
-	if err = ctx.putAccountRecord(fromRecord); err != nil {
-		return nil, err
-	}
-
-	err = ctx.putAccountRecord(&newRecord)
-	if err != nil {
-		return nil, err
-	}
-
-	if err = ctx.Prepare(); err != nil {
-		return nil, err
-	}
-
+	ctx.putAccountRecord(fromRecord)
+	ctx.putAccountRecord(&newRecord)
+	ctx.Prepare()
 	return &types.FungibleTransferResponse{
 		TypeId:        ctx.typeId,
 		Owner:         request.Owner,
 		Account:       request.Account,
 		NewOwner:      newRecord.Owner,
 		NewAccount:    newRecord.Account,
-		TxEnvelope:    ctx.TxEnvelope,
-		TxPayloadHash: ctx.TxPayloadHash,
-	}, nil
+		TxEnvelope:    ctx.txEnvelope,
+		TxPayloadHash: ctx.txPayloadHash,
+	}
 }

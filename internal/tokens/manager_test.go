@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"reflect"
+	"regexp"
 	"sort"
 	"testing"
 	"time"
@@ -97,7 +98,7 @@ func TestTokensManager_Deploy(t *testing.T) {
 	t.Run("error: deploy again", func(t *testing.T) {
 		deployResponseBad, err := manager.DeployTokenType(deployRequestMy)
 		assert.Error(t, err)
-		assert.EqualError(t, err, "token type already exists")
+		assert.Regexp(t, regexp.MustCompile(`token type \[.*] exists`), err.Error())
 		assert.Nil(t, deployResponseBad)
 	})
 
@@ -1347,20 +1348,16 @@ func (e *testEnv) clean() {
 // ============================================================
 
 func assertTokenHttpErr(t *testing.T, expectedStatus int, actualResponse interface{}, actualErr error) bool {
-	if !assert.Nil(t, actualResponse, "Response %+v, Error: %v", actualResponse, actualErr) {
-		return false
-	}
-
-	if !assert.Error(t, actualErr) {
+	if !assert.Error(t, actualErr, "Response %+v, Error: %v", actualResponse, actualErr) {
 		return false
 	}
 
 	tknErr, ok := actualErr.(*common.TokenHttpErr)
 	if !ok {
 		return assert.Fail(t, fmt.Sprintf("Error expected to implement TokenHttpErr, but was %v.",
-			reflect.TypeOf(actualErr)), "Error: %v", actualErr)
+			reflect.TypeOf(actualErr)), "Response %+v, Error: %v", actualResponse, actualErr)
 	}
-	return assert.Equal(t, expectedStatus, tknErr.StatusCode, "Error: %v", actualErr)
+	return assert.Equal(t, expectedStatus, tknErr.StatusCode, "Response %+v, Error: %v", actualResponse, actualErr)
 }
 
 func assertTokenHttpErrMessage(t *testing.T, expectedStatus int, expectedMessage string, actualResponse interface{}, actualErr error) bool {
